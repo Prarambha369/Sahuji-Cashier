@@ -7,6 +7,11 @@
 #include <cstdlib>
 #include <ctime>
 #include <sstream>
+#include <cstdio>
+#include <cctype>
+#include <cstdint>
+#include <openssl/sha.h>
+#include <openssl/rand.h>
 #ifdef _WIN32
 #include <conio.h>
 #include <windows.h>
@@ -71,44 +76,153 @@ struct Bill {
 const string PRODUCT_FILE = "products.dat";
 const string CUSTOMER_FILE = "customers.dat";
 const string BILL_FILE = "bills.dat";
-const string ADMIN_PWD_FILE = "adminpwd.txt";
+const string ADMIN_PWD_FILE = "adminpwd.dat";     // stores "salt_hex:hash_hex" (never plaintext)
+const string LEGACY_PWD_FILE = "adminpwd.txt";    // old plaintext store; removed on migration
+const size_t ADMIN_SALT_BYTES = 16;               // random salt length
+const size_t ADMIN_MIN_PWD_LEN = 8;               // minimum password length
 
-string get_admin_password() {
+// --- SHA-256 helpers (OpenSSL) ---
+string sha256_hex(const string& data) {
+    unsigned char digest[SHA256_DIGEST_LENGTH];
+    SHA256(reinterpret_cast<const unsigned char*>(data.data()), data.size(), digest);
+    ostringstream oss;
+    oss << hex << setfill('0');
+    for (unsigned char c : digest) oss << setw(2) << static_cast<int>(c);
+    return oss.str();
+}
+
+string random_salt_hex() {
+    unsigned char salt[ADMIN_SALT_BYTES];
+    if (RAND_bytes(salt, static_cast<int>(ADMIN_SALT_BYTES)) != 1) {
+        // Extremely unlikely; OpenSSL CSPRNG failure. Fail closed with seed data instead.
+        srand(static_cast<unsigned>(time(nullptr)) ^ static_cast<unsigned>(reinterpret_cast<uintptr_t>(&salt)));
+        for (auto& b : salt) b = static_cast<unsigned char>(rand());
+    }
+    ostringstream oss;
+    oss << hex << setfill('0');
+    for (unsigned char c : salt) oss << setw(2) << static_cast<int>(c);
+    return oss.str();
+}
+
+string salted_password_hash(const string& salt_hex, const string& pwd) {
+    // Hash of salt||password; only this digest and the salt are ever stored.
+    return sha256_hex(salt_hex + pwd);
+}
+
+void trim_password(const string& raw, string& out) {
+    size_t start = raw.find_first_not_of(" \t\n\r");
+    size_t end = raw.find_last_not_of(" \t\n\r");
+    out = (start == string::npos) ? "" : raw.substr(start, end - start + 1);
+}
+
+// Returns true and fills salt/hash if a password record is stored.
+bool load_admin_password_record(string& salt_hex, string& hash_hex) {
     ifstream f(ADMIN_PWD_FILE);
-    string pwd;
-    if (f.is_open()) {
-        getline(f, pwd);
-        f.close();
-        if (!pwd.empty()) return pwd;
+    if (!f.is_open()) return false;
+    string line;
+    if (!getline(f, line)) return false;
+    f.close();
+    size_t sep = line.find(':');
+    if (sep == string::npos || sep == 0 || sep + 1 >= line.size()) return false;
+    string s = line.substr(0, sep);
+    string h = line.substr(sep + 1);
+    // Basic sanity: both fields must be hex of the expected length (64 hex chars each).
+    if (s.size() != 2 * ADMIN_SALT_BYTES || h.size() != 2 * SHA256_DIGEST_LENGTH) return false;
+    for (char c : s + h) {
+        if (!isxdigit(static_cast<unsigned char>(c))) return false;
     }
-    ofstream out(ADMIN_PWD_FILE);
-    out << "admin" << endl;
-    out.close();
-    return "admin";
+    salt_hex = s;
+    hash_hex = h;
+    return true;
 }
 
-bool set_admin_password(const string& newpwd) {
-    // Validate password (not empty and not just whitespace)
-    if (newpwd.empty() || newpwd.find_first_not_of(" \t\n\r") == string::npos) {
-        return false;
-    }
-    // Attempt to write the password to file
-    ofstream out(ADMIN_PWD_FILE);
-    if (!out.is_open()) {
-        return false;
-    }
-    out << newpwd << endl;
+bool save_admin_password_record(const string& salt_hex, const string& hash_hex) {
+    ofstream out(ADMIN_PWD_FILE, ios::trunc);
+    if (!out.is_open()) return false;
+    out << salt_hex << ':' << hash_hex << endl;
+    out.flush();
     out.close();
-    // Verify the password was saved correctly by reading it back
-    ifstream in(ADMIN_PWD_FILE);
-    if (!in.is_open()) {
-        return false;
-    }
-    string saved_pwd;
-    getline(in, saved_pwd);
-    in.close();
-    return saved_pwd == newpwd;
+    if (out.fail()) return false;
+    // Migration: drop the legacy plaintext password file if it still exists.
+    remove(LEGACY_PWD_FILE.c_str());
+    return true;
 }
+
+// Constant-time comparison to avoid timing side channels.
+bool constant_time_equal(const string& a, const string& b) {
+    if (a.size() != b.size()) return false;
+    volatile unsigned char diff = 0;
+    for (size_t i = 0; i < a.size(); ++i) {
+        diff |= static_cast<unsigned char>(a[i]) ^ static_cast<unsigned char>(b[i]);
+    }
+    return diff == 0;
+}
+
+// Verify a candidate password against the stored salted hash.
+bool verify_admin_password(const string& pwd) {
+    string salt_hex, hash_hex;
+    if (!load_admin_password_record(salt_hex, hash_hex)) return false;
+    string candidate = salted_password_hash(salt_hex, pwd);
+    return constant_time_equal(candidate, hash_hex);
+}
+
+// Store a new password as a fresh random-salted hash. Plaintext never touches disk.
+bool set_admin_password(const string& newpwd) {
+    if (newpwd.size() < ADMIN_MIN_PWD_LEN) return false;
+    string salt_hex = random_salt_hex();
+    return save_admin_password_record(salt_hex, salted_password_hash(salt_hex, newpwd));
+}
+
+// Prompt for a new password (min length), require a matching confirmation,
+// and return the trimmed password; returns "" if the user backs out.
+string prompt_new_password() {
+    while (true) {
+        string np, cp;
+        trim_password(get_input("\nEnter new password (min " + to_string(ADMIN_MIN_PWD_LEN) + " chars, or 'back' to cancel): "), np);
+        if (np == "back" || np == "menu" || np == "exit") return "";
+        if (np.size() < ADMIN_MIN_PWD_LEN) {
+            cout << "Error: Password must be at least " << ADMIN_MIN_PWD_LEN << " characters." << endl;
+            continue;
+        }
+        trim_password(get_input("Confirm new password: "), cp);
+        if (cp == "back" || cp == "menu" || cp == "exit") return "";
+        if (np != cp) {
+            cout << "Error: Passwords do not match. Please try again." << endl;
+            continue;
+        }
+        return np;
+    }
+}
+
+// First-run guard: if no password record exists, force the admin to create one.
+bool ensure_admin_password() {
+    string salt_hex, hash_hex;
+    if (load_admin_password_record(salt_hex, hash_hex)) return true;
+
+    ifstream legacy(LEGACY_PWD_FILE);
+    if (legacy.is_open()) {
+        legacy.close();
+        cout << "\nNote: an old plaintext password file (" << LEGACY_PWD_FILE
+             << ") was found and will no longer be used." << endl;
+        cout << "Passwords are now stored only as salted hashes." << endl;
+    }
+
+    cout << "\n--- First-time setup: create an admin password ---" << endl;
+    while (true) {
+        string pwd = prompt_new_password();
+        if (pwd.empty()) {
+            string again = get_input("Admin setup is required to use this menu. Try again? (y/n): ");
+            if (again != "y" && again != "Y") return false;
+            continue;
+        }
+        if (set_admin_password(pwd)) {
+            cout << "Success: Admin password created and stored as a salted hash." << endl;
+            return true;
+        }
+        cout << "Error: Failed to save the password. Check file permissions and try again." << endl;
+    }
+}
+
 
 // --- Robust text-based Product file helpers ---
 vector<Product> load_products() {
@@ -259,12 +373,15 @@ void generate_customer_id() {
 }
 
 void admin_menu() {
-    string pwd = get_admin_password();
+    if (!ensure_admin_password()) {
+        cout << "\nAdmin access denied: no admin password has been set up." << endl;
+        return;
+    }
     int tries = 3;
     while (tries--) {
         string input = get_input("\nEnter admin password (or 'back'): ");
         if (input == "back" || input == "menu" || input == "exit") return;
-        if (input == pwd) break;
+        if (verify_admin_password(input)) break;
         cout << "Incorrect password. Attempts left: " << tries << endl;
         if (tries == 0) return;
     }
@@ -381,44 +498,10 @@ void admin_menu() {
             }
             wait_key();
         } else if (input == "8") {
-            // Change admin password
-            string np = get_input("Enter new password: ");
-            if (np == "back" || np == "menu" || np == "exit") continue;
+            // Change admin password: min length + confirmation, stored as a salted hash.
+            string np = prompt_new_password();
+            if (np.empty()) continue;
 
-            // Trim whitespace from password
-            size_t start = np.find_first_not_of(" \t\n\r");
-            size_t end = np.find_last_not_of(" \t\n\r");
-            if (start != string::npos) {
-                np = np.substr(start, end - start + 1);
-            } else {
-                np = "";
-            }
-
-            // Validate password is not empty after trimming
-            if (np.empty()) {
-                cout << "Error: Password cannot be empty or contain only whitespace.";
-                continue;
-            }
-
-            string cp = get_input("Confirm new password: ");
-            if (cp == "back" || cp == "menu" || cp == "exit") continue;
-
-            // Trim whitespace from confirmation
-            start = cp.find_first_not_of(" \t\n\r");
-            end = cp.find_last_not_of(" \t\n\r");
-            if (start != string::npos) {
-                cp = cp.substr(start, end - start + 1);
-            } else {
-                cp = "";
-            }
-
-            // Check if passwords match
-            if (np != cp) {
-                cout << "Error: Passwords do not match. Please try again.";
-                continue;
-            }
-
-            // Attempt to save the new password
             if (set_admin_password(np)) {
                 cout << "Success: Admin password has been changed successfully!";
             } else {

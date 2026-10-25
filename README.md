@@ -12,6 +12,7 @@
 - [Admin Functions](#admin-functions)
 - [User Functions](#user-functions)
 - [Changing Admin Password](#changing-admin-password)
+- [Security](#security)
 - [Data Storage Update (2025)](#data-storage-update-2025)
 - [Troubleshooting](#troubleshooting)
 - [Screenshots and Videos](#screenshots-and-videos)
@@ -42,13 +43,13 @@
 ### 1. **Installation**
 #### Linux
 ```sh
-sudo apt install g++                # Install g++ if not already installed
-g++ sahuji.cpp -o sahuji            # Compile the program (recompile after code changes)
+sudo apt install g++ libssl-dev      # Install g++ and OpenSSL headers if not already installed
+g++ -std=c++17 sahuji.cpp -o sahuji -lcrypto   # Compile the program (recompile after code changes)
 ./sahuji                            # Run the program
 ```
 #### Windows
-- Install a C++ compiler like MinGW or use Visual Studio.
-- Compile with: `g++ sahuji.cpp -o sahuji`
+- Install a C++ compiler like MinGW and OpenSSL (e.g. Win32/Win64 OpenSSL) so its headers and `libcrypto` are available.
+- Compile with: `g++ -std=c++17 sahuji.cpp -o sahuji -lcrypto`
 - Run: `./sahuji` or `sahuji.exe` depending on your setup.
 
 ### 2. **Main Menu Navigation**
@@ -64,7 +65,13 @@ Use the number keys to select an option and follow the on-screen prompts.
 ---
 
 ## 🔐 Admin Functions
-To access admin features, select **ADMIN** from the main menu and enter the admin password (default: `admin`, or whatever you set).
+Select **ADMIN** from the main menu to use admin features.
+
+- **First run:** you are prompted to create an admin password (minimum 8
+  characters, with confirmation). This is required before you can use the
+  admin menu — there is no default password.
+- The password is stored only as a **salted SHA-256 hash** in `adminpwd.dat`;
+  it is never kept in plaintext (see [Security](#security)).
 
 **Admin Menu Options:**
 1. Add product
@@ -88,24 +95,38 @@ Select **USER** from the main menu to:
 ---
 
 ## 🔑 Changing Admin Password
-1. Log in as Admin.
-   - **Note:** The Admin password is `admin` by default, and can be changed in the menu.
+1. Log in as Admin with the password you created on first run.
 2. In the admin menu, select **8. Change Admin Password**.
-3. Enter and confirm the new password.
-4. The new password will be required for future admin logins.
+3. Enter and confirm the new password (minimum 8 characters).
+4. The new password is re-salted and re-hashed, then required for future admin logins.
+
+Old versions allowed a default password of `admin` in a plaintext
+`adminpwd.txt`; that support has been removed, and any leftover plaintext file
+is ignored and deleted once a new hashed password is saved.
+
+---
+
+## 🔒 Security
+- The admin password is stored only as `SHA-256(salt || password)` with a
+  random 16-byte OpenSSL salt, in `adminpwd.dat`. The plaintext is never
+  written to disk.
+- First-run setup forces password creation (minimum 8 characters + confirmation).
+- See [SECURITY.md](SECURITY.md) for details and hardening notes.
 
 ---
 
 ## ⚡ Data Storage Update (2025)
 - All data is now stored in plain text (CSV) files: `products.dat`, `customers.dat`, and `bills.dat`.
-- If you previously used an old version, delete any existing `.dat` files before running the new version to avoid crashes.
+- The admin password is an exception: `adminpwd.dat` holds only a salted SHA-256 hash, never plaintext.
+- If you previously used an old version, delete any existing `.dat` files before running the new version to avoid crashes (keep a note of your password — an old `adminpwd.txt`/default `admin` login will no longer work).
 - Data is cross-platform and human-readable.
 
 ---
 
 ## 🐞 Troubleshooting
 - If you get a crash or see strange characters in `.dat` files, delete those files and re-add your data.
-- Always recompile (`g++ sahuji.cpp -o sahuji`) after updating the code.
+- Always recompile (`g++ -std=c++17 sahuji.cpp -o sahuji -lcrypto`) after updating the code.
+- Forgot your admin password? Delete `adminpwd.dat` and restart the app to set a new one.
 
 ---
 
